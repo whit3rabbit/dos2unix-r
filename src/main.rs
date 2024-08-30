@@ -14,10 +14,6 @@ struct Opt {
     #[structopt(parse(from_os_str))]
     input: Vec<PathBuf>,
 
-    /// Convert to Unix line endings (LF)
-    #[structopt(short = "u", long)]
-    to_unix: bool,
-
     /// Convert to DOS line endings (CRLF)
     #[structopt(short = "d", long)]
     to_dos: bool,
@@ -77,11 +73,6 @@ fn main() -> io::Result<()> {
         std::process::exit(1);
     }
 
-    if !opt.to_unix && !opt.to_dos && !opt.info {
-        error!("No action specified. Use --to-unix, --to-dos, or --info.");
-        std::process::exit(1);
-    }
-
     for input in &opt.input {
         if let Err(e) = process_input(input, &opt) {
             error!("Error processing {}: {}", input.display(), e);
@@ -123,14 +114,11 @@ fn process_input(input: &Path, opt: &Opt) -> io::Result<()> {
 fn process_file(path: &Path, opt: &Opt) -> io::Result<()> {
     if opt.info {
         print_file_info(path, &opt.from_encoding)?;
-    } else if opt.to_unix {
-        convert_file(path, opt, dos2unix)?;
     } else if opt.to_dos {
         convert_file(path, opt, unix2dos)?;
     } else {
-        if !opt.quiet {
-            warn!("No conversion direction specified. Use --to-unix or --to-dos.");
-        }
+        // Default behavior: convert to Unix
+        convert_file(path, opt, dos2unix)?;
     }
 
     Ok(())

@@ -12,7 +12,7 @@ on:
         type: string
 
 env:
-  CRATE_NAME: repo2txt
+  CRATE_NAME: dos2unix
   GITHUB_TOKEN: ${{ github.token }}
   RUST_BACKTRACE: 1
 
@@ -27,27 +27,27 @@ jobs:
           - os_name: Linux-x86_64
             os: ubuntu-20.04
             target: x86_64-unknown-linux-musl
-            bin: repo2txt
+            bin: dos2unix
           - os_name: Linux-aarch64
             os: ubuntu-20.04
             target: aarch64-unknown-linux-musl
-            bin: repo2txt
+            bin: dos2unix
           - os_name: Windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            bin: repo2txt.exe
+            bin: dos2unix.exe
           - os_name: Windows-aarch64
             os: windows-latest
             target: aarch64-pc-windows-msvc
-            bin: repo2txt.exe
+            bin: dos2unix.exe
           - os_name: macOS-x86_64
             os: macOS-latest
             target: x86_64-apple-darwin
-            bin: repo2txt
+            bin: dos2unix
           - os_name: macOS-aarch64
             os: macOS-latest
             target: aarch64-apple-darwin
-            bin: repo2txt
+            bin: dos2unix
     env:
       SKIP_TESTS_OS_NAMES: Windows-aarch64 macOS-aarch64
     steps:

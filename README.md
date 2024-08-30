@@ -4,7 +4,7 @@
 
 ## Features
 
-- Convert between DOS (CRLF) and Unix (LF) line endings
+- Convert between DOS (CRLF) and Unix (LF) line endings (Unix is the default)
 - Detect and handle various file encodings (UTF-8, UTF-16LE, UTF-16BE, ISO-8859-1)
 - Process single files or recursively handle directories
 - Preserve file modification times
@@ -25,15 +25,15 @@ cd dos2unix-r
 cargo build --release
 ```
 
-The compiled binary will be available in `target/release/dos2unix` or on the releases page to donwnload.
+The compiled binary will be available in `target/release/dos2unix` or on the releases page to download.
 
 ## Usage
 
 Here are some common usage examples:
 
-1. Convert a file to Unix line endings:
+1. Convert a file to Unix line endings (default behavior):
    ```
-   dos2unix -u file.txt
+   dos2unix file.txt
    ```
 
 2. Convert a file to DOS line endings:
@@ -43,7 +43,7 @@ Here are some common usage examples:
 
 3. Recursively process a directory, converting all files to Unix line endings:
    ```
-   dos2unix -u -r directory/
+   dos2unix -r directory/
    ```
 
 4. Print file information without converting:
@@ -53,24 +53,41 @@ Here are some common usage examples:
 
 5. Convert a file to Unix line endings, creating a backup and preserving the modification time:
    ```
-   dos2unix -u -b -p file.txt
+   dos2unix -b -p file.txt
    ```
 
 ## Command-line Options
 
-- `-u, --to-unix`: Convert to Unix line endings (LF)
-- `-d, --to-dos`: Convert to DOS line endings (CRLF)
-- `-p, --keep-date`: Keep original file modification time
-- `-b, --backup`: Create backup of original file
-- `-v, --verbose`: Verbose output
-- `-q, --quiet`: Quiet mode
-- `-f, --force`: Force conversion of binary files
-- `--keep-bom`: Add or keep Byte Order Mark (BOM)
-- `--remove-bom`: Remove Byte Order Mark (BOM)
-- `--from-encoding <encoding>`: Specify input encoding (utf8, utf16le, utf16be, iso-8859-1)
-- `-r, --recursive`: Recursively process directories
-- `--follow-symlinks`: Follow symbolic links
-- `-i, --info`: Print file information
+```
+dos2unix 0.1.0
+Convert line endings between DOS and Unix formats
+
+USAGE:
+    dos2unix [FLAGS] [OPTIONS] [input]...
+
+FLAGS:
+    -b, --backup             Create backup of original file
+        --follow-symlinks    Follow symbolic links
+    -f, --force              Force conversion of binary files
+    -h, --help               Prints help information
+    -i, --info               Print file information
+        --keep-bom           Add or keep Byte Order Mark (BOM)
+    -p, --keep-date          Keep original file modification time
+    -q, --quiet              Quiet mode
+    -r, --recursive          Recursively process directories
+        --remove-bom         Remove Byte Order Mark (BOM)
+    -d, --to-dos             Convert to DOS line endings (CRLF)
+    -V, --version            Prints version information
+    -v, --verbose            Verbose output
+
+OPTIONS:
+        --from-encoding <from-encoding>    Specify input encoding (utf8, utf16le, utf16be, iso-8859-1) [default: auto]
+
+ARGS:
+    <input>...    Input files or directories
+```
+
+Note: The default behavior is now to convert to Unix line endings (LF) without needing to specify `-u` or `--to-unix`.
 
 ## Acknowledgments
 

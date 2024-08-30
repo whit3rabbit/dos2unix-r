@@ -11,3 +11,10 @@ filetime = "0.2.25"
 log = "0.4.22"
 structopt = "0.3.26"
 walkdir = "2.5.0"
+
+[profile.release]
+strip = true  # Automatically strip symbols from the binary.
+opt-level = 'z'  # Optimize for size
+lto = true       # Enable Link Time Optimization
+codegen-units = 1 # Reduce parallel code generation units to increase optimization
+panic = 'abort'  # Remove stack unwinding code

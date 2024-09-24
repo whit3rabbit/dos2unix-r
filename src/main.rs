@@ -1,352 +1,391 @@
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write, Seek, SeekFrom};
+use std::env;
+use std::ffi::OsString;
+use std::fs;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use structopt::StructOpt;
-use encoding_rs::{UTF_8, UTF_16LE, UTF_16BE, WINDOWS_1252, Encoding};
-use encoding_rs_io::DecodeReaderBytesBuilder;
-use walkdir::WalkDir;
 
-/// Command-line options for dos2unix
-#[derive(Debug, StructOpt)]
-#[structopt(name = "dos2unix", about = "Convert line endings between DOS and Unix formats")]
-struct Opt {
-    /// Input files or directories
-    #[structopt(parse(from_os_str))]
-    input: Vec<PathBuf>,
+#[cfg(windows)]
+use winapi::um::consoleapi::GetConsoleMode;
+#[cfg(windows)]
+use winapi::um::handleapi::INVALID_HANDLE_VALUE;
+#[cfg(windows)]
+use winapi::um::processenv::GetStdHandle;
+#[cfg(windows)]
+use winapi::um::winbase::STD_INPUT_HANDLE;
+#[cfg(windows)]
+use winapi::um::winnt::HANDLE;
 
-    /// Convert to DOS line endings (CRLF)
-    #[structopt(short = "d", long)]
-    to_dos: bool,
-
-    /// Keep original file modification time
-    #[structopt(short = "p", long)]
-    keep_date: bool,
-
-    /// Create backup of original file
-    #[structopt(short, long)]
-    backup: bool,
-
-    /// Verbose output
-    #[structopt(short, long)]
-    verbose: bool,
-
-    /// Quiet mode
-    #[structopt(short, long)]
-    quiet: bool,
-
-    /// Force conversion of binary files
-    #[structopt(short, long)]
-    force: bool,
-
-    /// Add or keep Byte Order Mark (BOM)
-    #[structopt(long)]
-    keep_bom: bool,
-
-    /// Remove Byte Order Mark (BOM)
-    #[structopt(long)]
-    remove_bom: bool,
-
-    /// Specify input encoding (utf8, utf16le, utf16be, iso-8859-1)
-    #[structopt(long, default_value = "auto")]
-    from_encoding: String,
-
-    /// Recursively process directories
-    #[structopt(short, long)]
-    recursive: bool,
-
-    /// Follow symbolic links
-    #[structopt(long)]
-    follow_symlinks: bool,
-
-    /// Print file information
-    #[structopt(short, long)]
-    info: bool,
-
-    /// Add Byte Order Mark (BOM)
-    #[structopt(short = "a", long = "add-bom")]
-    add_bom: bool,
-
-    /// Add additional newline
-    #[structopt(short = "l", long = "newline")]
-    newline: bool,
-
-    /// Safe mode (skip binary files)
-    #[structopt(short = "s", long = "safe")]
-    safe: bool,
-
-    /// Convert file in-place, keeping original file name
-    #[structopt(long = "oldfile")]
-    oldfile: bool,
-
-    /// Convert file to new file
-    #[structopt(long = "newfile")]
-    newfile: bool,
+fn print_help(progname: &str) {
+    println!("Usage: {} [options] [FILE ...] [-n INFILE OUTFILE]", progname);
+    println!("Converts text files with DOS or Mac line endings to Unix line endings.");
+    println!("Options:");
+    println!("  -b             Make a backup of each file.");
+    println!("  -f, --force    Force conversion of binary files.");
+    println!("  -k, --keep-bom Keep the Byte Order Mark (BOM).");
+    println!("  -m, --mac      Convert Mac line endings (CR) to Unix (LF).");
+    println!("  -o, --oldfile  Overwrite original file (default behavior).");
+    println!("  -n, --newfile  Specify new output file.");
+    println!("      --add-eol  Add missing end-of-line at end of file.");
+    println!("  -v, --verbose  Increase verbosity level (can be used multiple times).");
+    println!("      --help     Display this help and exit.");
+    println!("      --version  Output version information and exit.");
 }
 
-fn main() -> io::Result<()> {
-    let opt = Opt::from_args();
+fn print_version() {
+    println!("dos2unix rust version");
+}
 
-    if opt.input.is_empty() {
-        eprintln!("No input files or directories specified.");
-        std::process::exit(1);
-    }
-
-    for input in &opt.input {
-        if let Err(e) = process_input(input, &opt) {
-            eprintln!("Error processing {}: {}", input.display(), e);
+fn detect_binary(
+    content: &[u8],
+    force: bool,
+    verbose: usize,
+    progname: &str,
+) -> io::Result<()> {
+    let mut line_number = 1;
+    for &byte in content {
+        if byte < 32 && byte != b'\n' && byte != b'\r' && byte != b'\t' && byte != 0x0C {
+            if !force {
+                let error_msg = format!(
+                    "{}: Binary symbol 0x{:02X} found at line {}",
+                    progname, byte, line_number
+                );
+                if verbose > 0 {
+                    eprintln!("{}", error_msg);
+                }
+                return Err(io::Error::new(io::ErrorKind::InvalidData, error_msg));
+            } else {
+                if verbose > 0 {
+                    eprintln!(
+                        "{}: Binary symbol 0x{:02X} found at line {}; continuing due to --force.",
+                        progname, byte, line_number
+                    );
+                }
+                break;
+            }
+        }
+        if byte == b'\n' {
+            line_number += 1;
         }
     }
-
     Ok(())
 }
 
-/// Process input file or directory
-fn process_input(input: &Path, opt: &Opt) -> io::Result<()> {
-    if !input.exists() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, format!("Path does not exist: {}", input.display())));
+fn convert_line_endings(
+    content: &[u8],
+    keep_bom: bool,
+    force: bool,
+    mac_mode: bool,
+    add_eol: bool,
+    verbose: usize,
+    progname: &str,
+) -> io::Result<Vec<u8>> {
+    let mut result = Vec::with_capacity(content.len());
+    let mut idx = 0;
+    let mut prev_byte = None;
+    let mut line_number = 1;
+    let mut converted = 0;
+
+    // Check for BOM
+    if content.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        if keep_bom {
+            result.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+        }
+        idx = 3;
     }
 
-    if input.is_dir() {
-        process_directory(input, opt)
-    } else {
-        process_file(input, opt)
-    }
-}
+    detect_binary(&content[idx..], force, verbose, progname)?;
 
-/// Process a directory
-fn process_directory(dir: &Path, opt: &Opt) -> io::Result<()> {
-    if opt.recursive {
-        let walker = WalkDir::new(dir).follow_links(opt.follow_symlinks);
-        for entry in walker.into_iter() {
-            match entry {
-                Ok(entry) if entry.file_type().is_file() => {
-                    if let Err(e) = process_file(entry.path(), opt) {
-                        eprintln!("Error processing {}: {}", entry.path().display(), e);
+    while idx < content.len() {
+        let byte = content[idx];
+        idx += 1;
+
+        if mac_mode {
+            // Convert CR (\r) to LF (\n), but leave CRLF (\r\n) intact
+            if byte == b'\r' {
+                if idx < content.len() && content[idx] == b'\n' {
+                    // CRLF sequence, leave as is
+                    result.push(b'\r');
+                    result.push(b'\n');
+                    idx += 1;
+                } else {
+                    result.push(b'\n');
+                    converted += 1;
+                    line_number += 1;
+                    if verbose > 1 {
+                        eprintln!(
+                            "{}: Converted CR at line {}.",
+                            progname, line_number - 1
+                        );
                     }
                 }
-                Err(e) => eprintln!("Error accessing entry: {}", e),
-                _ => {}
-            }
-        }
-    } else {
-        if !opt.quiet {
-            eprintln!("Skipping directory: {}. Use --recursive to process directories.", dir.display());
-        }
-    }
-    Ok(())
-}
-
-/// Process a single file
-fn process_file(path: &Path, opt: &Opt) -> io::Result<()> {
-    if opt.info {
-        print_file_info(path, &opt.from_encoding)
-    } else if opt.to_dos {
-        convert_file(path, opt, unix2dos)
-    } else {
-        // Default behavior: convert to Unix
-        convert_file(path, opt, dos2unix)
-    }
-}
-
-/// Print file information
-fn print_file_info(input: &Path, from_encoding: &str) -> io::Result<()> {
-    let mut file = File::open(input)?;
-    let (encoding, bom_size) = detect_encoding_and_bom(&mut file, from_encoding)?;
-    file.seek(SeekFrom::Start(0))?;
-
-    let mut reader = DecodeReaderBytesBuilder::new()
-        .encoding(Some(encoding))
-        .build(file);
-
-    let mut content = String::new();
-    reader.read_to_string(&mut content)?;
-
-    let dos_count = content.matches("\r\n").count();
-    let unix_count = content.matches('\n').count() - dos_count;
-    let mac_count = content.matches('\r').count() - dos_count;
-
-    println!("File: {}", input.display());
-    println!("Encoding: {:?}", encoding);
-    println!("BOM: {}", if bom_size > 0 { "Present" } else { "Absent" });
-    println!("DOS line endings: {}", dos_count);
-    println!("Unix line endings: {}", unix_count);
-    println!("Mac line endings: {}", mac_count);
-
-    Ok(())
-}
-
-/// Detect file encoding and BOM
-fn detect_encoding_and_bom<R: Read + Seek>(reader: &mut R, specified_encoding: &str) -> io::Result<(&'static Encoding, usize)> {
-    if specified_encoding != "auto" {
-        return Ok((get_encoding(specified_encoding), 0));
-    }
-
-    let mut buffer = [0; 4];
-    let read_bytes = reader.read(&mut buffer)?;
-    reader.seek(SeekFrom::Start(0))?;
-
-    if read_bytes >= 3 && buffer.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        Ok((UTF_8, 3))
-    } else if read_bytes >= 2 && buffer.starts_with(&[0xFF, 0xFE]) {
-        Ok((UTF_16LE, 2))
-    } else if read_bytes >= 2 && buffer.starts_with(&[0xFE, 0xFF]) {
-        Ok((UTF_16BE, 2))
-    } else if read_bytes == 0 {
-        Err(io::Error::new(io::ErrorKind::UnexpectedEof, "File is empty"))
-    } else {
-        Ok((UTF_8, 0))
-    }
-}
-
-/// Convert file line endings
-fn convert_file<F>(input: &Path, opt: &Opt, convert_fn: F) -> io::Result<()>
-where
-    F: Fn(&str) -> String,
-{
-    let mut input_file = File::open(input)?;
-    let metadata = input_file.metadata()?;
-
-    let (encoding, bom_size) = detect_encoding_and_bom(&mut input_file, &opt.from_encoding)?;
-    input_file.seek(SeekFrom::Start(0))?;
-
-    let reader = DecodeReaderBytesBuilder::new()
-        .encoding(Some(encoding))
-        .build(input_file);
-
-    let output_path = if opt.newfile {
-        input.with_extension("new")
-    } else if opt.oldfile {
-        input.to_path_buf()
-    } else {
-        input.with_extension("tmp")
-    };
-
-    let mut writer = BufWriter::new(File::create(&output_path)?);
-
-    // Handle BOM
-    if (opt.add_bom || (opt.keep_bom && bom_size > 0)) && !opt.remove_bom {
-        let bom = if encoding == UTF_8 {
-            vec![0xEF, 0xBB, 0xBF]
-        } else if encoding == UTF_16LE {
-            vec![0xFF, 0xFE]
-        } else if encoding == UTF_16BE {
-            vec![0xFE, 0xFF]
-        } else {
-            vec![]
-        };
-        writer.write_all(&bom)?;
-    }
-
-    let mut content = String::new();
-    if metadata.len() > 10_000_000 { // 10 MB threshold
-        convert_large_file(reader, &mut writer, &mut content, &convert_fn, opt, encoding)?;
-    } else {
-        BufReader::new(reader).read_to_string(&mut content)?;
-        if !opt.force && is_binary(&content) {
-            if opt.safe {
-                if !opt.quiet {
-                    eprintln!("Skipping binary file: {}", input.display());
+            } else {
+                if byte == b'\n' {
+                    line_number += 1;
                 }
-                return Ok(());
-            } else if !opt.quiet {
-                eprintln!("Converting binary file: {}", input.display());
+                result.push(byte);
+            }
+        } else {
+            // DOS to UNIX conversion
+            if byte == b'\r' {
+                if idx < content.len() && content[idx] == b'\n' {
+                    // CRLF sequence, convert to LF
+                    result.push(b'\n');
+                    idx += 1;
+                    converted += 1;
+                    line_number += 1;
+                    if verbose > 1 {
+                        eprintln!(
+                            "{}: Converted CRLF to LF at line {}.",
+                            progname, line_number - 1
+                        );
+                    }
+                } else {
+                    // Single CR, leave as is (could be Mac line ending)
+                    result.push(b'\r');
+                }
+            } else {
+                if byte == b'\n' {
+                    line_number += 1;
+                }
+                result.push(byte);
             }
         }
-        let converted = convert_fn(&content);
-        let (cow, _, _) = encoding.encode(&converted);
-        writer.write_all(&cow)?;
+        prev_byte = Some(byte);
     }
 
-    if opt.keep_date {
-        let atime = filetime::FileTime::from_last_access_time(&metadata);
-        let mtime = filetime::FileTime::from_last_modification_time(&metadata);
-        filetime::set_file_times(&output_path, atime, mtime)?;
-    }
-
-    if opt.backup && !opt.newfile {
-        let backup_path = input.with_extension("bak");
-        if let Err(e) = std::fs::rename(input, &backup_path) {
-            return Err(io::Error::new(io::ErrorKind::Other, format!("Failed to create backup: {}", e)));
+    if add_eol {
+        if let Some(last_byte) = prev_byte {
+            if last_byte != b'\n' && last_byte != b'\r' {
+                if verbose > 1 {
+                    eprintln!("{}: Added line break to last line.", progname);
+                }
+                result.push(b'\n');
+                line_number += 1;
+            }
         }
     }
 
-    if !opt.newfile && !opt.oldfile {
-        if let Err(e) = std::fs::remove_file(input) {
-            return Err(io::Error::new(io::ErrorKind::Other, format!("Failed to remove original file: {}", e)));
-        }
-        if let Err(e) = std::fs::rename(&output_path, input) {
-            return Err(io::Error::new(io::ErrorKind::Other, format!("Failed to rename temporary file: {}", e)));
-        }
+    if verbose > 1 {
+        eprintln!(
+            "{}: Converted {} out of {} line breaks.",
+            progname,
+            converted,
+            line_number - 1
+        );
     }
 
-    if opt.verbose {
-        println!("Converted: {}", input.display());
-    }
-
-    Ok(())
+    Ok(result)
 }
 
-/// Convert large files line by line
-fn convert_large_file<R: Read, W: Write>(
-    reader: R,
-    writer: &mut W,
-    content: &mut String,
-    convert_fn: &dyn Fn(&str) -> String,
-    opt: &Opt,
-    encoding: &'static Encoding,
+fn process_file(
+    input_path: &Path,
+    output_path: Option<&Path>,
+    keep_bom: bool,
+    force: bool,
+    backup: bool,
+    mac_mode: bool,
+    add_eol: bool,
+    verbose: usize,
+    progname: &str,
 ) -> io::Result<()> {
-    let mut buf_reader = BufReader::new(reader);
+    let content = fs::read(input_path)?;
 
-    loop {
-        content.clear();
-        if buf_reader.read_line(content)? == 0 {
-            break;
+    match convert_line_endings(
+        &content,
+        keep_bom,
+        force,
+        mac_mode,
+        add_eol,
+        verbose,
+        progname,
+    ) {
+        Ok(converted_content) => {
+            if backup {
+                let backup_filename = format!("{}~", input_path.display());
+                if verbose > 0 {
+                    eprintln!(
+                        "{}: creating backup file '{}'",
+                        progname, backup_filename
+                    );
+                }
+                fs::copy(input_path, &backup_filename)?;
+            }
+
+            let output_path = output_path.unwrap_or(input_path);
+
+            // Preserve file permissions
+            let metadata = fs::metadata(input_path)?;
+            let permissions = metadata.permissions();
+
+            // Write the converted content to a temporary file first
+            let temp_path = output_path.with_extension("tmp");
+            fs::write(&temp_path, converted_content)?;
+
+            // Set the permissions of the temp file to match the original
+            fs::set_permissions(&temp_path, permissions)?;
+
+            // Replace the original file with the temp file
+            fs::rename(&temp_path, output_path)?;
+
+            if verbose > 0 {
+                eprintln!("{}: converted '{}'", progname, input_path.display());
+            }
+
+            Ok(())
         }
-        let converted_line = convert_fn(content);
-        if opt.newline && !converted_line.ends_with('\n') {
-            let modified_line = format!("{}\n", converted_line);
-            let (cow, _, _) = encoding.encode(&modified_line);
-            writer.write_all(&cow)?;
+        Err(e) => Err(e),
+    }
+}
+
+fn is_stdin_tty() -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        extern "C" {
+            fn isatty(fd: i32) -> i32;
+        }
+        unsafe { isatty(io::stdin().as_raw_fd()) != 0 }
+    }
+    #[cfg(windows)]
+    {
+        unsafe {
+            let handle: HANDLE = GetStdHandle(STD_INPUT_HANDLE);
+            if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+                return false;
+            }
+            let mut mode: u32 = 0; // Ensure mode is u32
+            GetConsoleMode(handle, &mut mode) != 0
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // For other platforms, assume stdin is not a TTY
+        false
+    }
+}
+fn main() {
+    let args: Vec<OsString> = env::args_os().collect();
+    let progname = Path::new(&args[0])
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    let mut files = Vec::new();
+    let mut keep_bom = false;
+    let mut force = false;
+    let mut backup = false;
+    let mut mac_mode = false;
+    let mut add_eol = false;
+    let mut verbose = 0;
+    let mut i = 1;
+
+    while i < args.len() {
+        match args[i].to_string_lossy().as_ref() {
+            "--help" => {
+                print_help(&progname);
+                return;
+            }
+            "--version" => {
+                print_version();
+                return;
+            }
+            "-k" | "--keep-bom" => keep_bom = true,
+            "-f" | "--force" => force = true,
+            "-b" => backup = true,
+            "-m" | "--mac" => mac_mode = true,
+            "--add-eol" => add_eol = true,
+            "-v" | "--verbose" => verbose += 1,
+            "-n" | "--newfile" => {
+                if i + 2 >= args.len() {
+                    eprintln!(
+                        "{}: option '{}' requires two arguments.",
+                        progname,
+                        args[i].to_string_lossy()
+                    );
+                    return;
+                }
+                let infile = Path::new(&args[i + 1]);
+                let outfile = Path::new(&args[i + 2]);
+                i += 2;
+
+                if let Err(e) = process_file(
+                    infile,
+                    Some(outfile),
+                    keep_bom,
+                    force,
+                    backup,
+                    mac_mode,
+                    add_eol,
+                    verbose,
+                    &progname,
+                ) {
+                    eprintln!("{}: Error converting '{}': {}", progname, infile.display(), e);
+                    if !force {
+                        eprintln!("{}: Use --force to convert binary files.", progname);
+                    }
+                }
+            }
+            arg if arg.starts_with('-') => {
+                eprintln!("{}: invalid option '{}'", progname, arg);
+                eprintln!("Try '{} --help' for more information.", progname);
+                return;
+            }
+            filename => {
+                files.push(PathBuf::from(filename));
+            }
+        }
+        i += 1;
+    }
+
+    if files.is_empty() {
+        // Check if stdin is connected to a terminal
+        if is_stdin_tty() {
+            eprintln!("{}: No files specified and no input provided.", progname);
+            eprintln!("Try '{} --help' for more information.", progname);
+            std::process::exit(1);
         } else {
-            let (cow, _, _) = encoding.encode(&converted_line);
-            writer.write_all(&cow)?;
+            // Read from stdin
+            let mut input = Vec::new();
+            io::stdin().read_to_end(&mut input).unwrap();
+
+            match convert_line_endings(
+                &input,
+                keep_bom,
+                force,
+                mac_mode,
+                add_eol,
+                verbose,
+                &progname,
+            ) {
+                Ok(converted_content) => {
+                    io::stdout().write_all(&converted_content).unwrap();
+                }
+                Err(e) => {
+                    eprintln!("{}: Error converting input: {}", progname, e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    } else {
+        // Process files as before
+        for input_path in files {
+            if let Err(e) = process_file(
+                &input_path,
+                None,
+                keep_bom,
+                force,
+                backup,
+                mac_mode,
+                add_eol,
+                verbose,
+                &progname,
+            ) {
+                eprintln!("{}: Error converting '{}': {}", progname, input_path.display(), e);
+                if !force {
+                    eprintln!("{}: Use --force to convert binary files.", progname);
+                }
+            }
         }
     }
-
-    Ok(())
-}
-
-/// Convert DOS line endings to Unix
-fn dos2unix(input: &str) -> String {
-    input.replace("\r\n", "\n")
-}
-
-/// Convert Unix line endings to DOS
-fn unix2dos(input: &str) -> String {
-    input.replace("\n", "\r\n")
-}
-
-/// Get encoding from string
-fn get_encoding(encoding: &str) -> &'static Encoding {
-    match encoding.to_lowercase().as_str() {
-        "utf8" => UTF_8,
-        "utf16le" => UTF_16LE,
-        "utf16be" => UTF_16BE,
-        "iso-8859-1" => WINDOWS_1252,
-        _ => UTF_8,
-    }
-}
-
-/// Check if content is binary
-fn is_binary(content: &str) -> bool {
-    const BINARY_CHECK_CHARS: usize = 8000;
-    let check_size = content.chars().take(BINARY_CHECK_CHARS).count();
-    content.chars().take(check_size).any(|c| {
-        let code = c as u32;
-        code < 32 &&
-        c != '\n' &&
-        c != '\r' &&
-        c != '\t' &&
-        c != '\x0C'
-    })
 }
